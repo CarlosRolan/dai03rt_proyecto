@@ -2,77 +2,99 @@ import os, json, time, urllib.parse, urllib.request
 from datetime import datetime, timezone, timedelta
 import boto3
 
-s3 = boto3.client('s3')
+# Configuración
+API_KEY = os.environ.get("TMDB_API_KEY")
+BUCKET = os.environ.get("BUCKET_NAME", "mi-bucket-local")
+PREFIX = os.environ.get("S3_PREFIX", "daily_updates/")
+REQUEST_SLEEP = float(os.environ.get("REQUEST_SLEEP", "0.25"))
+MAX_PAGES = int(os.environ.get("MAX_PAGES", "50"))  # límite por bloque
+DAYS_BACK = int(os.environ.get("DAYS_BACK", "1"))
+LOCAL_MODE = os.environ.get("LOCAL_MODE", "false").lower() == "true"
 
-# Intentar cargar variables de entorno desde un archivo .env (solo para pruebas locales)
-try:
-    from dotenv import load_dotenv
-    from os.path import dirname, join
-    load_dotenv(join(dirname(__file__), ".env"))
-except ImportError:
-    pass
+BASE = "https://api.themoviedb.org/3"
 
-# Cargar variables de entorno
-API_KEY = os.environ['TMDB_API_KEY'] # Clave API de TMDB
-BUCKET = os.environ['BUCKET_NAME'] # Nombre del bucket S3
-PREFIX = os.environ.get('S3_PREFIX', 'daily_updates/') # Prefijo en S3 donde se guardan los archivos
-REQUEST_SLEEP = float(os.environ.get('REQUEST_SLEEP', '0.25')) # Tiempo de espera entre peticiones a la API
-MAX_PAGES = int(os.environ.get('MAX_PAGES', '5'))  # Número máximo de páginas a descargar, 5 para pruebas
-DAYS_BACK = int(os.environ.get('DAYS_BACK', '1'))  # Días hacia atrás para la ventana de cambios
+# Cliente S3 (solo si no estamos en local)
+s3 = boto3.client("s3", region_name="eu-west-1")
 
-BASE = 'https://api.themoviedb.org/3'
 
-# Función para hacer peticiones HTTP GET a la API de TMDB
+# Petición Get
 def http_get(path, params):
-    params['api_key'] = API_KEY
+    params["api_key"] = API_KEY
     url = f"{BASE}{path}?{urllib.parse.urlencode(params)}"
+    print(f"📡 {url}")
     with urllib.request.urlopen(url) as resp:
-        return json.loads(resp.read().decode('utf-8'))
+        return json.loads(resp.read().decode("utf-8"))
 
-# Función para guardar un objeto JSON en S3
+
+# Petición Put
 def put_json(obj, key):
-    s3.put_object(
-        Bucket=BUCKET,
-        Key=key,
-        Body=json.dumps(obj, ensure_ascii=False).encode('utf-8'),
-        ContentType='application/json'
-    )
+    if LOCAL_MODE:
+        os.makedirs("output", exist_ok=True)
+        path = os.path.join("output", key.replace("/", "_"))
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+        print(f"✅ Guardado local: {path}")
+    else:
+        s3.put_object(
+            Bucket=BUCKET,
+            Key=key,
+            Body=json.dumps(obj, ensure_ascii=False).encode("utf-8"),
+            ContentType="application/json",
+        )
+        print(f"✅ Guardado en S3: {key}")
 
-# Función principal del Lambda
-def lambda_handler(event, context):
-    # Ventana de cambios: de hoy-DAYS_BACK a hoy (UTC)
-    today = datetime.now(timezone.utc).date()
-    start_date = today - timedelta(days=DAYS_BACK)
-    end_date = today
 
-    ts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
-    date_part = start_date.strftime('%Y-%m-%d')
+# Función para llamar por cada tipo de recurso, movie, tv o people
+def process_changes(kind, endpoint, start_date, end_date, ts, date_part, block=1):
     saved = 0
-
     page = 1
+    total_pages = 0  
+
     while page <= MAX_PAGES:
-        data = http_get('/movie/changes', {
-            'start_date': start_date.isoformat(),
-            'end_date': end_date.isoformat(),
-            'page': page
+        data = http_get(endpoint, {
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "page": page
         })
 
-        # Guardar en S3
-        key = f"{PREFIX}dt={date_part}/changes_page_{page}_{ts}.json"
+        total_pages = int(data.get("total_pages", 1))
+
+        if not data.get("results"):
+            print(f" No hay resultados en {endpoint}, página {page}")
+            break
+
+        key = f"{PREFIX}{kind}/dt={date_part}/{kind}_changes_page_{page}_block{block}_{ts}.json"
         put_json(data, key)
         saved += 1
 
-        total_pages = int(data.get('total_pages', 1))
-        page += 1
-        if page > total_pages:
+        if page >= total_pages:
             break
+        page += 1
         time.sleep(REQUEST_SLEEP)
 
+    print(f" Guardadas {saved} páginas de {endpoint} (bloque {block})")
+    return saved, page, total_pages
+
+
+# Obtener changes de movies, tv y people diarias
+def lambda_handler(event=None, context=None):
+    today = datetime.now(timezone.utc).date()
+    start_date = today - timedelta(days=DAYS_BACK)
+    end_date = today
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    date_part = start_date.strftime("%Y-%m-%d")
+
+    # Movies
+    process_changes("movie", "/movie/changes", start_date, end_date, ts, date_part)
+
+    # TV
+    process_changes("tv", "/tv/changes", start_date, end_date, ts, date_part)
+
+    # People
+    process_changes("people", "/person/changes", start_date, end_date, ts, date_part)
+
     return {
-        'statusCode': 200,
-        'body': f'Guardadas {saved} páginas de /movie/changes en s3://{BUCKET}/{PREFIX}dt={date_part}/'
+        "statusCode": 200,
+        "body": "✅ Guardadas todas las páginas de movies, tv y people"
     }
 
-# Prueba local
-if __name__ == "__main__":
-    print(lambda_handler({}, {}))

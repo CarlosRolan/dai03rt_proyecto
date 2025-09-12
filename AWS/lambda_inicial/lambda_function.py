@@ -1,59 +1,119 @@
-import os, json, time, urllib.parse, urllib.request
-from datetime import datetime, timezone
+import os
+import json
+import time
+import urllib.request
 import boto3
+from datetime import datetime
 
-s3 = boto3.client('s3')
 
-# Intentar cargar variables de entorno desde un archivo .env (solo para pruebas locales)
+BUCKET = os.environ.get("S3_BUCKET", "mi-bucket")   
+LANG = "es"
+PREFIX = "initial_load"
+REQUEST_SLEEP = 0.3
+MAX_PAGES = int(os.environ.get("MAX_PAGES", 0))     # Para que se decraguen todas, 0
+
 try:
-    from dotenv import load_dotenv
-    from os.path import dirname, join
-    load_dotenv(join(dirname(__file__), ".env"))
-except ImportError:
-    pass
+    API_KEY = os.environ["TMDB_API_KEY"]
+except KeyError:
+    raise RuntimeError(" ERROR: No se encontró la variable de entorno TMDB_API_KEY en Lambda")
 
-# Cargar variables de entorno
-API_KEY = os.environ['TMDB_API_KEY'] # Clave API de TMDB
-BUCKET = os.environ['BUCKET_NAME'] # Nombre del bucket S3
-LANG = os.environ.get('TMDB_LANGUAGE', 'es-ES') # Idioma
-MAX_PAGES = int(os.environ.get('MAX_PAGES', '2'))  # Número máximo de páginas a descargar, ponemos 2 para pruebas
-PREFIX = os.environ.get('S3_PREFIX', 'initial_load/') # Prefijo en S3 donde se guardan los archivos
-REQUEST_SLEEP = float(os.environ.get('REQUEST_SLEEP', '0.3')) # Tiempo de espera entre peticiones a la API
+BASE = "https://api.themoviedb.org/3/"
 
-BASE = 'https://api.themoviedb.org/3'
 
-# Función para hacer peticiones HTTP GET a la API de TMDB
-def http_get(path, params):
-    params['api_key'] = API_KEY
-    url = f"{BASE}{path}?{urllib.parse.urlencode(params)}"
-    with urllib.request.urlopen(url) as resp:
-        return json.loads(resp.read().decode('utf-8'))
-    
-# Función para guardar un objeto JSON en S3
+s3 = boto3.client("s3", region_name="eu-west-1")
+
+def http_get(path):
+    sep = "&" if "?" in path else "?"
+    url = f"{BASE}{path}{sep}api_key={API_KEY}"
+    print(f"📡 Llamando a: {url}")
+
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    return data
+
+
 def put_json(obj, key):
     s3.put_object(
         Bucket=BUCKET,
         Key=key,
-        Body=json.dumps(obj, ensure_ascii=False).encode('utf-8'),
-        ContentType='application/json'
+        Body=json.dumps(obj, ensure_ascii=False).encode("utf-8"),
+        ContentType="application/json"
     )
+    print(f" Guardado {key} en S3")
 
-# Función principal del Lambda
+
 def lambda_handler(event, context):
-    ts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+    current_year = datetime.now().year
+    year_20_back = current_year - 20
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     saved = 0
-    for page in range(1, MAX_PAGES + 1):
-        data = http_get('/discover/movie', {
-            'language': LANG,
-            'sort_by': 'popularity.desc',
-            'page': page
-        })
-        key = f"{PREFIX}{page}_page.json"
+
+    # Para separa por bloques que no se bloquee aws
+    start_page = int(event.get("start_page", 1))
+    end_page   = int(event.get("end_page", start_page + 49))  #  50 páginas
+
+    # PELICULAS
+    page = start_page
+    while page <= end_page:
+        path = (
+            f"movie/popular?language={LANG}&sort_by=popularity.desc"
+            f"&primary_release_date.gte={year_20_back}-01-01&page={page}"
+        )
+        data = http_get(path)
+
+        key = f"{PREFIX}/movies/{page}_movies_{ts}.json"
         put_json(data, key)
         saved += 1
         time.sleep(REQUEST_SLEEP)
-    return {'statusCode': 200, 'body': f'Guardadas {saved} páginas en s3://{BUCKET}/{PREFIX}'}
 
-# Prueba local
-if __name__ == "__main__":
-    print(lambda_handler({}, {}))
+        total_pages = data.get("total_pages", 1)
+        if page >= total_pages or page >= 500:
+            break
+        page += 1
+
+    # TV
+    page = start_page
+    while page <= end_page:
+        path = (
+            f"discover/tv?language={LANG}&sort_by=popularity.desc"
+            f"&first_air_date.gte={year_20_back}-01-01&page={page}"
+        )
+        data = http_get(path)
+
+        key = f"{PREFIX}/tv/{page}_tv_{ts}.json"
+        put_json(data, key)
+        saved += 1
+        time.sleep(REQUEST_SLEEP)
+
+        total_pages = data.get("total_pages", 1)
+        if page >= total_pages or page >= 500:
+            break
+        page += 1
+
+    # PEOPLE
+    page = start_page
+    while page <= end_page:
+        path = f"person/popular?language={LANG}&page={page}"
+        data = http_get(path)
+
+        key = f"{PREFIX}/people/{page}_people_{ts}.json"
+        put_json(data, key)
+        saved += 1
+        time.sleep(REQUEST_SLEEP)
+
+        total_pages = data.get("total_pages", 1)
+        if page >= total_pages or page >= 500:
+            break
+        page += 1
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps({
+            "message": f"✅ Descargadas {saved} páginas en total (movies+tv+people)",
+            "start_page": start_page,
+            "end_page": page
+        })
+    }
+
