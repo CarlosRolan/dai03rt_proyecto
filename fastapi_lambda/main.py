@@ -28,6 +28,11 @@ def ask_visual_placeholder():
 handler = Mangum(app)
 
 
-# Para comprobar en navegador
+# Para comprobar en navegador , uvicorn fastapi_lambda.main:app --reload
+
 # http://127.0.0.1:8000/ , saldrá el mensaje de bienvenida
 # http://127.0.0.1:8000/docs , saldrán los endpoint
+
+# En EC2  ,  uvicorn fastapi_lambda.main:app --host 0.0.0.0 --port 8000, no se necesita magnum
+# http://<IP_PUBLICA>:8000/  ,  http://54.246.30.204:8000/
+# http://<IP_PUBLICA>:8000/docs  , http://54.246.30.204:8000/docs
